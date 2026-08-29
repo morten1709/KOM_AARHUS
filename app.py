@@ -15,8 +15,8 @@ from datetime import datetime, timezone
 # 1. CONSTANTS & DATABASES
 # ==========================================
 DB_FILE = "segment_database.json"
-AIR_DENSITY = 1.225      
-GRAVITY = 9.81           
+AIR_DENSITY = 1.225
+GRAVITY = 9.81
 DRIVETRAIN_LOSS = 0.03
 
 st.set_page_config(page_title="KOM Hunter", layout="wide")
@@ -42,31 +42,22 @@ def estimate_max_power(duration_sec, p_max, w_prime_kj, cp):
     k = w_prime_joules / (p_max - cp)
     return float(cp + (w_prime_joules / (duration_sec + k)))
 
+@st.cache_data(ttl=1800)
 def get_live_weather(lat, lon, hours_ahead=0):
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "wind_speed_unit": "ms",
-        "timezone": "Europe/Copenhagen"
-    }
+    url = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+    headers = {"User-Agent": "AarhusKOMHunter/1.0 github.com/morten1709"}
+    params = {"lat": lat, "lon": lon}
     
-    if hours_ahead == 0:
-        params["current"] = "wind_speed_10m,wind_direction_10m"
-    else:
-        params["hourly"] = "wind_speed_10m,wind_direction_10m"
-        
     try:
-        response = requests.get(url, params=params, timeout=5)
+        response = requests.get(url, headers=headers, params=params, timeout=5)
         if response.status_code == 200:
             data = response.json()
-            if hours_ahead == 0:
-                return data["current"]["wind_speed_10m"], data["current"]["wind_direction_10m"]
-            else:
-                now = datetime.now(timezone.utc)
-                for i in range(len(data["hourly"]["time"])):
-                    if i == hours_ahead: 
-                        return data["hourly"]["wind_speed_10m"][i], data["hourly"]["wind_direction_10m"][i]
+            timeseries = data["properties"]["timeseries"]
+            if hours_ahead < len(timeseries):
+                current_weather = timeseries[hours_ahead]["data"]["instant"]["details"]
+                wind_speed = current_weather.get("wind_speed", 0.0)
+                wind_dir = current_weather.get("wind_from_direction", 0.0)
+                return wind_speed, wind_dir
     except:
         pass
     return 0.0, 0.0
@@ -105,19 +96,17 @@ def calculate_dynamic_power_with_wind(streams, target_time, system_weight, CdA, 
     low_power, high_power = 0.0, 2500.0
     best_power = 0.0
     
-    for _ in range(30): 
+    for _ in range(30):
         mid_power = (low_power + high_power) / 2.0
         P_eff = mid_power * eta
-        
         v_low = np.zeros_like(d)
-        v_high = np.full_like(d, 40.0) 
+        v_high = np.full_like(d, 40.0)
         
         for _ in range(20):
             v_mid = (v_low + v_high) / 2.0
             v_air = v_mid + hw
             F_aero = c_aero * v_air * np.abs(v_air)
             F_resist = c_grav + F_aero
-            
             P_req = F_resist * v_mid
             
             mask = P_req > P_eff
@@ -125,23 +114,61 @@ def calculate_dynamic_power_with_wind(streams, target_time, system_weight, CdA, 
             v_low[~mask] = v_mid[~mask]
             
         v = (v_low + v_high) / 2.0
-        v = np.maximum(v, 0.1) 
-        
+        v = np.maximum(v, 0.1)
         total_time = np.sum(d / v)
         
         if total_time > target_time:
-            low_power = mid_power 
+            low_power = mid_power
         else:
             high_power = mid_power
             best_power = mid_power
             
     return best_power, avg_wind_effect
 
+def generate_pacing_plan(streams, best_power, system_weight, CdA, Crr, wind_speed, wind_dir):
+    distances = np.array(streams['distance'])
+    altitudes = np.array(streams['altitude'])
+    latlngs = np.array(streams['latlng'])
+    
+    d = np.diff(distances)
+    valid = d > 0
+    d = d[valid]
+    elev = np.diff(altitudes)[valid]
+    grade = elev / d
+    
+    lat1, lon1 = np.radians(latlngs[:-1, 0][valid]), np.radians(latlngs[:-1, 1][valid])
+    lat2, lon2 = np.radians(latlngs[1:, 0][valid]), np.radians(latlngs[1:, 1][valid])
+    dlon = lon2 - lon1
+    bearings = (np.degrees(np.arctan2(np.sin(dlon) * np.cos(lat2), np.cos(lat1) * np.sin(lat2) - (np.sin(lat1) * np.cos(lat2) * np.cos(dlon)))) + 360) % 360
+    
+    hw = wind_speed * np.cos(np.radians(wind_dir - bearings))
+    c_aero = 0.5 * AIR_DENSITY * CdA
+    c_grav = system_weight * GRAVITY * (grade + Crr)
+    P_eff = best_power * (1.0 - DRIVETRAIN_LOSS)
+    
+    v_low, v_high = np.zeros_like(d), np.full_like(d, 40.0)
+    for _ in range(20):
+        v_mid = (v_low + v_high) / 2.0
+        v_air = v_mid + hw
+        mask = ((c_grav + (c_aero * v_air * np.abs(v_air))) * v_mid) > P_eff
+        v_high[mask] = v_mid[mask]
+        v_low[~mask] = v_mid[~mask]
+        
+    v = np.maximum((v_low + v_high) / 2.0, 0.1)
+    
+    # Setting Distance as the index forces Streamlit charts to use it as the shared X-Axis
+    return pd.DataFrame({
+        "Distance (m)": np.round(distances[1:][valid]).astype(int),
+        "Elevation (m)": altitudes[1:][valid],
+        "Speed (km/h)": v * 3.6,
+        "Gradient (%)": grade * 100
+    }).set_index("Distance (m)")
+
 # ==========================================
 # 3. SIDEBAR UI
 # ==========================================
 with st.sidebar:
-    st.header("🎯 Target Filters")
+    st.header("Target Filters")
     max_dist = st.slider("Max Distance (m)", min_value=200, max_value=5000, value=5000, step=100)
 
     st.header("👥 Drafting Strategy")
@@ -219,7 +246,6 @@ with st.sidebar:
 # ==========================================
 # 4. MAIN DASHBOARD EXECUTION
 # ==========================================
-st.title("🏆 Segment Physics Engine")
 
 db = load_database()
 if not db:
@@ -238,7 +264,7 @@ system_weight = rider_weight + bike_weight
 CdA = estimate_cda(rider_weight, rider_height, position[1], clothing[1], helmet[1], drafting[1])
 Crr = surface[1]
 
-with st.sidebar.expander("📈 View Your Power Curve", expanded=False):
+with st.sidebar.expander("View Your Power Curve", expanded=False):
     curve_times = np.linspace(5, 1200, 100)
     curve_watts = [estimate_max_power(t, p_max, w_prime_kj, cp) for t in curve_times]
     chart_data = {"Seconds": curve_times, "Max Watts": curve_watts}
@@ -286,7 +312,7 @@ with st.spinner("Integrating meter-by-meter physics..."):
     </div>
     """
     folium.Marker(
-        location=[c_lat, c_lon], 
+        location=[c_lat, c_lon],
         icon=folium.DivIcon(html=wind_center_html)
     ).add_to(m)
     
@@ -301,7 +327,7 @@ with st.spinner("Integrating meter-by-meter physics..."):
     
     for seg_id, data in db.items():
         dist = data["distance"]
-        if dist > max_dist: continue # Apply distance filter
+        if dist > max_dist: continue 
         if "streams" not in data or data["kom_sec"] <= 0: continue
         
         kom_sec = data["kom_sec"]
@@ -339,20 +365,15 @@ with st.spinner("Integrating meter-by-meter physics..."):
         line_color = colormap(difficulty_ratio)
         
         tooltip_html = f"""
-        <div style='font-family: Arial; font-size: 13px; min-width: 150px;'>
-            <b>{data['name']}</b><br>
+        <div style='font-family: Arial; font-size: 13px; min-width: 170px;'>
+            <b>{data['name']}</b><br><hr style='margin: 2px 0;'>
+            <b>Target Speed:</b> <span style='font-size: 15px; color: #1e90ff; font-weight: bold;'>{round((dist / kom_sec) * 3.6, 1)} km/h</span><br>
+            <b>Target Watts:</b> <span style='font-size: 15px; color: {"#d32f2f" if not possible else "#388e3c"}; font-weight: bold;'>{int(round(req_watts_wind))}W</span><br>
             <hr style='margin: 2px 0;'>
-            <b>Attempts:</b> {attempts:,}<br>
-            <b>Distance:</b> {round(dist)} m<br>
-            <b>Grade:</b> {data['average_grade']}%<br>
             <b>Time to beat:</b> {time_str} ({kom_sec}s)<br>
-            <b>Target Speed:</b> {round((dist / kom_sec) * 3.6, 1)} km/h<br>
-            <b>Avg Wind:</b> {wind_str}<br>
-            <hr style='margin: 2px 0;'>
-            <b>Req Watts (With Wind):</b> <span style='color: {"#d32f2f" if not possible else "#388e3c"}; font-weight: bold;'>{int(round(req_watts_wind))}W</span><br>
-            <b>Req Watts (No Wind):</b> <span style='font-weight: bold;'>{int(round(req_watts_nowind))}W</span><br>
-            <b>Your Limit:</b> {int(round(user_max))}W<br>
-            <b>Margin:</b> {watt_margin}W {'(To Spare)' if watt_margin >= 0 else '(Short)'}
+            <b>Distance:</b> {round(dist)} m | <b>Avg Grade:</b> {data['average_grade']}%<br>
+            <b>Avg Wind Effect:</b> {wind_str}<br>
+            <b>Your Limit:</b> {int(round(user_max))}W | <b>Margin:</b> {watt_margin}W
         </div>
         """
         
@@ -367,7 +388,7 @@ with st.spinner("Integrating meter-by-meter physics..."):
         df = pd.DataFrame(table_data)
         
         sort_mode = st.selectbox(
-            "Sort Segments By:", 
+            "Sort Segments By:",
             ["Largest Watt Margin (Easiest)", "Most Attempts", "Most Attempts (Achievable Only)"]
         )
         
@@ -380,10 +401,40 @@ with st.spinner("Integrating meter-by-meter physics..."):
                 df = df[df["Possible?"] == "🟢"].sort_values("Attempts", ascending=False)
                 
             st.dataframe(
-                df, 
-                height=530, 
+                df,
+                height=530,
                 use_container_width=True,
                 column_config={
                     "Link": st.column_config.LinkColumn("Strava", display_text="View")
                 }
             )
+
+# ==========================================
+# 5. SEGMENT DEEP DIVE 
+# ==========================================
+st.divider()
+st.header("🔍 Segment Deep Dive")
+
+if not df.empty:
+    seg_names = {d["name"]: k for k, d in db.items() if d["distance"] <= max_dist and "streams" in d and d["kom_sec"] > 0}
+    selected_name = st.selectbox("Select a Segment for Elevation Analysis:", options=list(seg_names.keys()))
+    
+    if selected_name:
+        seg_id = seg_names[selected_name]
+        seg_data = db[seg_id]
+        
+        req_watts, _ = calculate_dynamic_power_with_wind(
+            seg_data["streams"], seg_data["kom_sec"], system_weight, CdA, Crr, wind_speed, wind_dir
+        )
+        pacing_df = generate_pacing_plan(
+            seg_data["streams"], req_watts, system_weight, CdA, Crr, wind_speed, wind_dir
+        )
+        
+        st.markdown(f"### **Target Constant Power:** <span style='color:#388e3c'>{int(round(req_watts))}W</span>", unsafe_allow_html=True)
+        st.caption(f"To beat the KOM time of {seg_data['kom_sec']} seconds on this terrain, you must output a steady {int(round(req_watts))} watts for the entire segment.")
+        
+        if pacing_df["Elevation (m)"].max() == 0:
+            st.warning("⚠️ **Missing Elevation Data:** The Open-Meteo API failed to return altitude for this segment when you ran the extractor script. The physics engine is treating it as perfectly flat.")
+
+        st.markdown("#### Elevation Profile (m)")
+        st.area_chart(pacing_df["Elevation (m)"], color="#8b4513")
